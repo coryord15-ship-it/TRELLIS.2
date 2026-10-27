@@ -1,0 +1,451 @@
+--- /home/hatch/workspace/trellis-r33-build/generate.py	2026-10-25 23:11:16.493271453 -0400
++++ /home/hatch/workspace/trellis-r34-bounds-fix/generate.py	2026-10-26 01:37:57.804703854 -0400
+@@ -1376,6 +1376,372 @@
+     of masking the clipped file with the stock chain."""
+ 
+ 
++# ---------------------------------------------------------------------
++# r34: BOUNDS FIX - the small-component op is REMOVED from the
++# sectioned export path (pipeline-fix program item #2; the mechanism
++# was solved by the two-pass audit, BOUNDS-AUDIT-PASS1.md and
++# BOUNDS-AUDIT-PASS2-CENSUS.md in the r33 build tree).
++#
++# What the audit measured (job 028, subject 1024 control arm): the
++# Step-2 cleanup bundle inside o_voxel.postprocess.to_glb -
++#   remove_duplicate_faces(); repair_non_manifold_edges();
++#   remove_small_connected_components(1e-5); fill_holes(3e-2)
++# - deleted 4.7% / 18.6% / 42.3% / 82.2% / 96.1% of sections 0-4 in
++# cleanup #1 alone, the loss growing with height. The deleter is
++# the small-component op acting on the mesh AS THE REPAIR LEAVES
++# IT: judged by manifold-only connectivity (faces linked only
++# across edges with exactly two incident faces), the upper
++# sections are gravel - sec3 is 338,440 fragments (largest 4.27%
++# of the section), sec4 is 40,533 (largest 332 faces) - because
++# 84.7% / 93.2% of their faces touch an edge shared by 3+ faces.
++# Under ordinary vertex connectivity the same sec3 is 97.0% one
++# component: the op was deleting the subject, not dust. (Duplicate
++# removal was measured innocent: 0.00% extra faces in every
++# section of both meshes. The 1e-5 threshold is NOT the problem -
++# at every plausible referent the cutoff lands at 1-30 faces and
++# the fragments are smaller than that; tuning it is explicitly
++# not this fix.)
++#
++# THE CHANGE, confined to the SECTIONED to_glb calls in
++# sectioned_export below:
++#   1. While a section's to_glb runs, the bundle is replaced by
++#      the explicit op sequence WITHOUT
++#      remove_small_connected_components: remove_duplicate_faces,
++#      repair_non_manifold_edges and fill_holes still run, in the
++#      bundle's own order, at both cleanup passes (the pre-simplify
++#      initial fill_holes is untouched) - only the small-component
++#      calls are intercepted and skipped. Every op is logged with
++#      before/after face counts under [r34-ops], so any future
++#      cleanup loss has its per-op counts printed in the same run
++#      that suffers it (audit PASS 1, item 3).
++#   2. Before each section's to_glb, the section's
++#      manifold-fragment census is logged under [r34-census]
++#      (audit PASS 2 fix-shape item 2): manifold-only component
++#      count, largest-fragment share, and the share of faces
++#      touching a non-manifold edge - the three numbers that
++#      predict this defect, printed next to the export they
++#      describe.
++#
++# HOW the interception works, and why two routes: the bundle runs
++# inside upstream's to_glb on a cumesh.CuMesh instance; this file
++# cannot rewrite that function without forking the whole export
++# (UV unwrap, BVH, texture baking). So each sectioned call runs
++# under the _R34SectionCleanup context manager below, which
++# patches the four bundle ops for exactly the duration of one
++# to_glb call and restores the originals on exit, whatever
++# happens. Route A patches the CuMesh class methods directly
++# (the r32 wrappers' precedent); if the compiled class refuses
++# attribute assignment, route B swaps the cumesh module reference
++# inside o_voxel.postprocess for a shim whose CuMesh factory
++# returns a delegating proxy that intercepts only the four ops.
++# Patchability is proven once per sectioned export (a probe
++# enter/exit before the section loop) and re-verified by
++# read-back at every install; if neither route can be installed,
++# R34CleanupError aborts the run - it subclasses
++# BoundsVerificationError, so the caller applies the r27
++# contract: exit 5, NO stock-chain fallback. An export that
++# silently kept the killer op would be worse than no export.
++#
++# WHAT DOES NOT CHANGE: the non-sectioned (stock) to_glb path,
++# extraction, the fill, chunking, the cascade, the section
++# cutter, the gates - all byte-identical to r33. The source of
++# the non-manifold edges themselves (extraction vs the fill's
++# centroid fans) is still unattributed; that fix belongs to the
++# stage the op-by-op probe convicts, not to this one (audit
++# PASS 2 fix-shape item 3).
++
++
++class R34CleanupError(BoundsVerificationError):
++    """r34: raised when the sectioned cleanup override cannot be
++    installed, so no sectioned export in this run could be trusted
++    to exclude remove_small_connected_components. Subclasses
++    BoundsVerificationError so the export call site applies the
++    same no-fallback contract (exit 5): never mask a known-bad
++    export with the stock chain."""
++
++
++def _component_sizes(n_faces, a, b):
++    """Sizes of the connected components of the face graph whose
++    edges are (a[i], b[i]). scipy's sparse csgraph when importable
++    (the audit census scripts' own engine), a union-find otherwise;
++    the two agree exactly on component sizes - only speed
++    differs."""
++    import numpy as _np
++
++    if len(a):
++        try:
++            import scipy.sparse as _sp
++            import scipy.sparse.csgraph as _cg
++
++            _g = _sp.coo_matrix(
++                (_np.ones(len(a), dtype=_np.int8), (a, b)),
++                shape=(n_faces, n_faces))
++            _, _lab = _cg.connected_components(
++                _g, directed=False, return_labels=True)
++            return _np.bincount(_lab)
++        except Exception:
++            pass
++    _parent = list(range(n_faces))
++
++    def _find(_x):
++        while _parent[_x] != _x:
++            _parent[_x] = _parent[_parent[_x]]
++            _x = _parent[_x]
++        return _x
++
++    for _x, _y in zip(a.tolist(), b.tolist()):
++        _rx, _ry = _find(int(_x)), _find(int(_y))
++        if _rx != _ry:
++            _parent[_rx] = _ry
++    _sizes = _np.bincount(
++        _np.fromiter((_find(_i) for _i in range(n_faces)),
++                     dtype=_np.int64, count=n_faces))
++    # bincount over root ids leaves a zero wherever an index is no
++    # component's root; drop the zeros so the count is exact.
++    return _sizes[_sizes > 0]
++
++
++def manifold_fragment_census(faces):
++    """r34: the audit PASS 2 manifold-fragment census of one mesh
++    (host numpy; the census scripts' recipe, verbatim): component
++    count under MANIFOLD-ONLY connectivity - faces linked only
++    across edges with exactly two incident faces, the state the
++    cleanup bundle's repair-then-remove sequence effectively
++    judges - the largest fragment's share, and the share of faces
++    touching a non-manifold edge (incidence 3+). Takes an (N, 3)
++    integer face array (vertex ids < 2^32; compacted or not -
++    relabelling changes neither incidence nor connectivity).
++    Returns a dict of plain numbers. Reproduces PASS 2's published
++    sec3/sec4 counts on job 028's raw sections (338,440 components,
++    largest 41,500 faces / 40,533 components, largest 332)."""
++    import numpy as _np
++
++    _f = _np.asarray(faces, dtype=_np.int64)
++    if _f.ndim != 2 or _f.shape[1] != 3 or _f.shape[0] == 0:
++        return {"n_faces": 0, "n_components": 0, "largest_faces": 0,
++                "largest_pct": 0.0, "pct_touch_nonmanifold": 0.0}
++    _n = int(_f.shape[0])
++    _e = _np.vstack([
++        _np.stack([_f[:, 0], _f[:, 1]], axis=1),
++        _np.stack([_f[:, 1], _f[:, 2]], axis=1),
++        _np.stack([_f[:, 2], _f[:, 0]], axis=1),
++    ])
++    _es = _np.sort(_e, axis=1)
++    _key = _es[:, 0] * (1 << 32) + _es[:, 1]
++    _, _inv, _ecnt = _np.unique(_key, return_inverse=True,
++                                return_counts=True)
++    _eids = _inv.reshape(3, _n).T
++    _inc = _ecnt[_eids]
++    _pct_nm = float(100.0 * (_inc.max(axis=1) > 2).mean())
++    _eid_flat = _np.concatenate([_eids[:, 0], _eids[:, 1], _eids[:, 2]])
++    _face_of = _np.tile(_np.arange(_n), 3)
++    _man = _ecnt[_eid_flat] == 2
++    _fo = _face_of[_man]
++    _ef = _eid_flat[_man]
++    _ord = _np.argsort(_ef, kind="stable")
++    _fo_s, _ef_s = _fo[_ord], _ef[_ord]
++    _same = _ef_s[1:] == _ef_s[:-1]
++    _sizes = _component_sizes(_n, _fo_s[:-1][_same], _fo_s[1:][_same])
++    _largest = int(_sizes.max()) if _sizes.size else 0
++    return {"n_faces": _n,
++            "n_components": int(_sizes.size),
++            "largest_faces": _largest,
++            "largest_pct": float(100.0 * _largest / _n),
++            "pct_touch_nonmanifold": _pct_nm}
++
++
++_R34_BUNDLE_OPS = ("remove_duplicate_faces", "repair_non_manifold_edges",
++                   "remove_small_connected_components", "fill_holes")
++
++
++class _R34SectionCleanup:
++    """r34: context manager replacing the to_glb cleanup bundle
++    with the explicit r34 op sequence for ONE sectioned to_glb
++    call: remove_small_connected_components is intercepted and
++    skipped; the other three bundle ops run stock, in the
++    bundle's order, each logged with before/after face counts
++    under [r34-ops]. Originals are restored on exit no matter
++    what. Routes A (CuMesh class patch) and B (postprocess
++    module shim) are in the r34 header above."""
++
++    def __init__(self, section_idx, probe=False):
++        self.section = section_idx
++        self.probe = probe
++        self.route = None
++        self._counts = {}
++        self._orig = None
++        self._restore = None
++
++    def _num_faces(self, obj):
++        try:
++            return int(obj.num_faces)
++        except Exception:
++            return -1
++
++    def _pass_label(self, name):
++        _k = self._counts.get(name, 0) + 1
++        self._counts[name] = _k
++        if name == "fill_holes":
++            # to_glb calls fill_holes once before the cleanups
++            # (initial fill) and once inside each cleanup pass.
++            return "initial fill" if _k == 1 else f"cleanup #{_k - 1}"
++        return f"cleanup #{_k}"
++
++    def _run_op(self, orig_call, obj, name, args, kwargs):
++        _label = self._pass_label(name)
++        _before = self._num_faces(obj)
++        if name == "remove_small_connected_components":
++            if args:
++                _thr = args[0]
++            elif kwargs:
++                _thr = next(iter(kwargs.values()))
++            else:
++                _thr = "?"
++            if not self.probe:
++                log(f"[r34-ops] section {self.section}: {_label} "
++                    f"remove_small_connected_components({_thr}) "
++                    f"SKIPPED (r34) - {_before} faces unchanged")
++            return None
++        _res = orig_call(*args, **kwargs)
++        if not self.probe:
++            log(f"[r34-ops] section {self.section}: {_label} {name}: "
++                f"{_before} -> {self._num_faces(obj)} faces")
++        return _res
++
++    def _enter_route_a(self, cumesh):
++        _cls = cumesh.CuMesh
++        _orig = {}
++        try:
++            for _name in _R34_BUNDLE_OPS:
++                _orig[_name] = getattr(_cls, _name)
++        except Exception:
++            return False
++        _ctx = self
++
++        def _make(_name, _fn):
++            def _wrapper(_obj, *args, **kwargs):
++                return _ctx._run_op(
++                    lambda *a, **k: _fn(_obj, *a, **k),
++                    _obj, _name, args, kwargs)
++            return _wrapper
++
++        _wrapped = {_name: _make(_name, _orig[_name])
++                    for _name in _R34_BUNDLE_OPS}
++        try:
++            for _name, _w in _wrapped.items():
++                setattr(_cls, _name, _w)
++            if getattr(_cls, "remove_small_connected_components") is not \
++                    _wrapped["remove_small_connected_components"]:
++                raise TypeError("CuMesh class patch did not stick")
++        except Exception:
++            for _name, _fn in _orig.items():
++                try:
++                    setattr(_cls, _name, _fn)
++                except Exception:
++                    pass
++            return False
++        self._orig = _orig
++
++        def _restore():
++            for _name, _fn in _orig.items():
++                try:
++                    setattr(_cls, _name, _fn)
++                except Exception:
++                    pass
++
++        self._restore = _restore
++        self.route = "A (CuMesh class patch)"
++        return True
++
++    def _enter_route_b(self, cumesh):
++        try:
++            import o_voxel.postprocess as _pp
++        except Exception:
++            return False
++        _ctx = self
++        _real_cls = cumesh.CuMesh
++
++        class _Proxy:
++            def __init__(self, _real):
++                object.__setattr__(self, "_r34_real", _real)
++
++            def __getattr__(self, _name):
++                _real = object.__getattribute__(self, "_r34_real")
++                if _name in _R34_BUNDLE_OPS:
++                    _fn = getattr(_real, _name)
++                    return lambda *a, **k: _ctx._run_op(
++                        _fn, _real, _name, a, k)
++                return getattr(_real, _name)
++
++            def __setattr__(self, _name, _value):
++                setattr(object.__getattribute__(self, "_r34_real"),
++                        _name, _value)
++
++        def _factory(*args, **kwargs):
++            return _Proxy(_real_cls(*args, **kwargs))
++
++        class _Shim:
++            def __init__(self):
++                self.CuMesh = _factory
++
++            def __getattr__(self, _name):
++                return getattr(cumesh, _name)
++
++        _orig_mod = _pp.cumesh
++        try:
++            _pp.cumesh = _Shim()
++            if _pp.cumesh is _orig_mod or \
++                    _pp.cumesh.CuMesh is not _factory:
++                raise TypeError("postprocess module shim did not stick")
++        except Exception:
++            try:
++                _pp.cumesh = _orig_mod
++            except Exception:
++                pass
++            return False
++
++        def _restore():
++            _pp.cumesh = _orig_mod
++
++        self._restore = _restore
++        self.route = "B (o_voxel.postprocess cumesh shim)"
++        return True
++
++    def __enter__(self):
++        try:
++            import cumesh
++        except Exception as _e:
++            raise R34CleanupError(
++                f"r34: cumesh is not importable ({_e!r}) - the "
++                "sectioned cleanup override cannot be installed"
++            ) from _e
++        if self._enter_route_a(cumesh) or self._enter_route_b(cumesh):
++            if self.probe:
++                log(f"[r34] cleanup override patchability probe OK "
++                    f"(route {self.route})")
++            else:
++                log(f"[r34] section {self.section}: cleanup override "
++                    f"ACTIVE via route {self.route} - "
++                    "remove_small_connected_components excluded, "
++                    "bundle ops logged under [r34-ops]")
++            return self
++        raise R34CleanupError(
++            "r34: neither the CuMesh class patch nor the postprocess "
++            "module shim could be installed - refusing to run a "
++            "sectioned export that would silently keep "
++            "remove_small_connected_components")
++
++    def __exit__(self, *exc):
++        if self._restore is not None:
++            try:
++                self._restore()
++            except Exception:
++                log("[r34] WARNING: cleanup override restore failed:\n"
++                    + traceback.format_exc())
++            self._restore = None
++        return False
++
++
+ def glb_axis_bounds(path):
+     """r27: read an exported GLB back with trimesh and return
+     (min, max) per axis over ALL geometry in the file, or None if the
+@@ -1975,6 +2341,13 @@
+             if _b - _a > _HARD:
+                 raise RuntimeError(f"sectioned export: exported range {_a}-{_b} ({_b - _a} faces) still exceeds the hard cap {_HARD} after splitting - refusing to call to_glb over the 2^20 cliff")
+         _nsec = len(_ranges)
++        # r34: prove the cleanup override installs BEFORE the first
++        # section runs. If it cannot, R34CleanupError (a
++        # BoundsVerificationError) aborts the whole export under the
++        # caller's r27 no-fallback contract - a section must never
++        # run under an override that is not actually in place.
++        with _R34SectionCleanup(-1, probe=True):
++            pass
+         _stem = args.output[:-4] if args.output.endswith(".glb") else args.output
+         _ok = []
+         _skipped = []
+@@ -1995,6 +2368,17 @@
+             _deg = int(((_fc2[:, 0] == _fc2[:, 1]) | (_fc2[:, 1] == _fc2[:, 2]) | (_fc2[:, 0] == _fc2[:, 2])).sum())
+             _ratio = _deg / max(1, _fc2.shape[0])
+             _p = f"{_stem}-sec{_i}.glb"
++            # r34 CENSUS (audit PASS 2 fix-shape item 2): log this
++            # section's manifold-fragment census - the bounds
++            # defect's three predictor numbers - on the exact
++            # compacted mesh to_glb is about to receive, before the
++            # op sequence runs. Diagnostic only: a census failure
++            # never blocks the export.
++            try:
++                _cen = manifold_fragment_census(_fc2)
++                log(f"[r34-census] section {_i}/{_nsec}: {_cen['n_faces']} faces, manifold-only components={_cen['n_components']}, largest fragment {_cen['largest_faces']} faces ({_cen['largest_pct']:.2f}%), faces touching a non-manifold edge {_cen['pct_touch_nonmanifold']:.1f}%")
++            except Exception:
++                log(f"[r34-census] section {_i}/{_nsec}: census failed (diagnostic only - export continues):\n" + traceback.format_exc())
+             # r27: SUBSET THE VOXEL FIELD WITH THE SECTION. r24 handed
+             # to_glb the section's compacted verts/faces alongside the
+             # FULL coords/attrs, and every sectioned export came back
+@@ -2034,21 +2418,28 @@
+                 log(f"[sections] section {_i}: voxel-field subsetting failed - passing the full coords/attrs; the bounds gate below still guards this export:\n" + traceback.format_exc())
+                 _coords_arg, _attrs_arg = mesh.coords, mesh.attrs
+             try:
+-                _glb = o_voxel.postprocess.to_glb(
+-                    vertices=_torch.as_tensor(_vc, dtype=mesh.vertices.dtype, device=mesh.vertices.device),
+-                    faces=_torch.as_tensor(_fc2, dtype=mesh.faces.dtype, device=mesh.faces.device),
+-                    attr_volume=_attrs_arg,
+-                    coords=_coords_arg,
+-                    attr_layout=mesh.layout,
+-                    voxel_size=mesh.voxel_size,
+-                    aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+-                    decimation_target=_tgt,
+-                    texture_size=args.texture_size,
+-                    remesh=False,
+-                    remesh_band=1,
+-                    remesh_project=0,
+-                    verbose=True,
+-                )
++                # r34: this section's to_glb runs under the cleanup
++                # override - remove_small_connected_components is
++                # excluded and the remaining bundle ops are logged
++                # per-op under [r34-ops]. The override is restored
++                # the moment to_glb returns, so nothing outside this
++                # call (the stock path included) ever sees it.
++                with _R34SectionCleanup(_i):
++                    _glb = o_voxel.postprocess.to_glb(
++                        vertices=_torch.as_tensor(_vc, dtype=mesh.vertices.dtype, device=mesh.vertices.device),
++                        faces=_torch.as_tensor(_fc2, dtype=mesh.faces.dtype, device=mesh.faces.device),
++                        attr_volume=_attrs_arg,
++                        coords=_coords_arg,
++                        attr_layout=mesh.layout,
++                        voxel_size=mesh.voxel_size,
++                        aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
++                        decimation_target=_tgt,
++                        texture_size=args.texture_size,
++                        remesh=False,
++                        remesh_band=1,
++                        remesh_project=0,
++                        verbose=True,
++                    )
+                 _glb.export(_p, extension_webp=True)
+             except Exception:
+                 # r24 SKIP-DON'T-ABORT: one failed section must not
